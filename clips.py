@@ -12,8 +12,9 @@ from typing import Any
 
 VIEWS = ("primary", "left_hand", "right_hand", "secondary")
 GRID_VIEWS = ("primary", "secondary", "left_hand", "right_hand")
-# Crop parameters from the supplied left-eye crop script.
-LEFT_ONLY_CROP_FILTER = "crop=1920:1200:160:0"
+# Remove the 160-pixel QR-code strip on the left, split the remaining
+# side-by-side stereo frame in half, and preserve the left-eye resolution.
+LEFT_ONLY_CROP_FILTER = "crop=(iw-160)/2:ih:160:0"
 ANNOTATION_TIMEBASES = ("raw-primary", "aligned")
 TIMELINE_FILES = {
     "src": "pts_src_{view}.csv",
@@ -251,6 +252,16 @@ def is_segments_annotation(path: Path) -> bool:
     return isinstance(payload.get("instances", {}).get("segments"), list)
 
 
+def annotation_timebase(path: Path) -> str | None:
+    """Return the timebase declared by an annotation file, when present."""
+    try:
+        with path.open(encoding="utf-8") as f:
+            value = json.load(f).get("annotationTimebase")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if value in ANNOTATION_TIMEBASES else None
+
+
 def load_annotations(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as f:
         payload = json.load(f)
@@ -318,8 +329,8 @@ def build_left_only_ffmpeg_command(
 ) -> list[str]:
     return [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(input_path),
         "-ss", f"{start_sec:.6f}",
+        "-i", str(input_path),
         "-t", f"{end_sec - start_sec:.6f}",
         "-vf", f"{crop_filter},setpts=PTS-STARTPTS",
         "-an", "-c:v", "libx264", "-preset", "veryfast",
@@ -515,7 +526,7 @@ def build_clip_plan(
     validate_mp4_frames: bool = True,
     input_subdir: str | None = None,
     annotation_timebase: str = "raw-primary",
-    include_only_left: bool = False,
+    include_only_left: bool = True,
     simple_output_names: bool = False,
 ) -> dict[str, Any]:
     if timeline not in TIMELINE_FILES:
@@ -652,7 +663,20 @@ def build_clip_plan(
                 continue
             clips: dict[str, Any] = {}
             invalid_view: str | None = None
-            for view in VIEWS:
+            primary_clip_start_sec = map_wallclock_to_view_time(
+                primary_rows, canonical_start_wallclock_ns
+            )[1]
+            primary_clip_end_sec = map_wallclock_to_view_time(
+                primary_rows, canonical_end_wallclock_ns
+            )[1]
+            primary_ffmpeg_start_sec = row_ffmpeg_sec(
+                primary_start_row, primary_clip_start_sec
+            )
+            primary_ffmpeg_end_sec = row_ffmpeg_sec(
+                primary_end_row, primary_clip_end_sec
+            )
+            planned_views = VIEWS
+            for view in planned_views:
                 view_rows = timestamp_rows[view]
                 start_row, start_sec, start_wallclock_error_ns = map_wallclock_to_view_time(
                     view_rows,
@@ -709,10 +733,10 @@ def build_clip_plan(
                         output_dir / f"section_{section['id']}" /
                         ("only_left.mp4" if simple_output_names else "recording_primary_left.mp4")
                     ),
-                    "start_sec": clips["primary"]["start_sec"],
-                    "end_sec": clips["primary"]["end_sec"],
-                    "ffmpeg_start_sec": clips["primary"]["ffmpeg_start_sec"],
-                    "ffmpeg_end_sec": clips["primary"]["ffmpeg_end_sec"],
+                    "start_sec": primary_clip_start_sec,
+                    "end_sec": primary_clip_end_sec,
+                    "ffmpeg_start_sec": primary_ffmpeg_start_sec,
+                    "ffmpeg_end_sec": primary_ffmpeg_end_sec,
                     "crop_filter": LEFT_ONLY_CROP_FILTER,
                     "source_view": "primary",
                 }
@@ -759,7 +783,7 @@ def build_aligned_input_clip_plan(
     recording_dir: Path,
     annotation_path: Path,
     output_dir: Path | None = None,
-    include_only_left: bool = False,
+    include_only_left: bool = True,
     simple_output_names: bool = False,
 ) -> dict[str, Any]:
     recording_dir = recording_dir.resolve()
@@ -775,7 +799,8 @@ def build_aligned_input_clip_plan(
     for section in sections:
         for range_index, (start_sec, end_sec) in enumerate(section["time"]):
             clips: dict[str, Any] = {}
-            for view in VIEWS:
+            planned_views = VIEWS
+            for view in planned_views:
                 simple_name = {"primary": "primary.mp4", "secondary": "secondary.mp4", "left_hand": "left_hand.mp4", "right_hand": "right_hand.mp4"}[view]
                 output_name = simple_name if simple_output_names else f"recording_{view}.mp4"
                 clips[view] = {
@@ -1184,9 +1209,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--annotation-timebase",
         choices=ANNOTATION_TIMEBASES,
-        default="raw-primary",
+        default=None,
         help=(
-            "Time base used by annotation.json. 'raw-primary' treats times as "
+            "Time base used by annotation.json. Defaults to annotationTimebase "
+            "when present, otherwise 'raw-primary'. 'raw-primary' treats times as "
             "original primary-video seconds; 'aligned' treats them as seconds "
             "from the shared aligned overlap. Both modes cut the original videos."
         ),
@@ -1194,7 +1220,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--include-only-left",
         action="store_true",
-        help="Also export a left-eye crop from each primary clip.",
+        help="Explicitly request the left-eye crop (it is enabled by default).",
     )
     parser.add_argument(
         "--simple-output-names",
@@ -1204,7 +1230,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--make-grid",
         action="store_true",
-        help="After exporting the four clips for each section, also create a 2x2 combined_grid.mp4.",
+        help="Also export the four source clips and create a 2x2 combined_grid.mp4.",
     )
     parser.add_argument(
         "--grid-cell-width",
@@ -1272,8 +1298,15 @@ def main(argv: list[str] | None = None) -> int:
 
         annotation_path = Path(args.annotation) if args.annotation else default_annotation_path(recording_dir)
         segments_annotation = annotation_path.exists() and is_segments_annotation(annotation_path)
-        include_only_left = args.include_only_left or segments_annotation
+        # All annotation formats export the four synchronized views plus the
+        # cropped left-eye artifact by default.
+        include_only_left = True
         simple_output_names = args.simple_output_names or segments_annotation
+        selected_timebase = (
+            args.annotation_timebase
+            or (annotation_timebase(annotation_path) if annotation_path.exists() else None)
+            or "raw-primary"
+        )
         if segments_annotation and args.output_dir is None:
             output_dir = (recording_dir.parent if recording_dir.name == "aligned" else recording_dir) / "clip"
         if aligned_input:
@@ -1322,7 +1355,7 @@ def main(argv: list[str] | None = None) -> int:
             timeline=args.timeline,
             validate_mp4_frames=not args.no_validate_mp4_frames,
             input_subdir=input_subdir,
-            annotation_timebase=args.annotation_timebase,
+            annotation_timebase=selected_timebase,
             include_only_left=include_only_left,
             simple_output_names=simple_output_names,
         )

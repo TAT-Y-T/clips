@@ -171,11 +171,12 @@ frame,pts_ns,wallclock_ns
 
 该格式会自动转换为内部的 section 结构。`attributes` 中的非空值会按换行拼接，写入每个片段目录下的 `describe.txt`。
 
-当检测到 `instances.segments` 格式时，脚本默认启用：
+默认导出四路视频和左眼裁切视频；检测到 `instances.segments` 格式时，另外自动启用：
 
-- 左眼裁剪输出；
 - 简化的输出文件名；
 - 默认输出目录 `clip/`（仅在没有显式指定 `--output-dir` 时生效）。
+
+如果 JSON 顶层包含 `annotationTimebase`（例如 `aligned`），脚本会自动采用它；也可以用命令行参数覆盖。
 
 ## 快速开始
 
@@ -187,12 +188,12 @@ python3 clips.py /path/to/recording_dir
 
 默认行为：
 
-1. 读取四路 MP4；
+1. 读取四路 MP4 及时间戳；
 2. 读取 `_timestamps/timestamps_*.csv`；
 3. 将 CSV 时间戳与 MP4 帧 PTS 匹配；
 4. 读取 `annotation.json`；
-5. 将标注时间按主视角时间基准映射到四路视频；
-6. 在 `<recording_dir>/clips/` 下导出片段；
+5. 将标注时间按标注声明的时间基准映射到四路视频；
+6. 在 `<recording_dir>/clips/` 下导出四路片段和 `only_left.mp4`（或 `recording_primary_left.mp4`）；
 7. 写入 manifest 和对齐报告。
 
 建议先使用 dry-run 检查计划：
@@ -225,9 +226,9 @@ python3 clips.py --help
 | `--timeline NAME` | `timestamps` | 选择时间戳文件族：`src`、`encoded`、`decoded`、`timestamps` |
 | `--no-validate-mp4-frames` | 关闭 | 不将 CSV 行与 MP4 实际帧 PTS 匹配 |
 | `--annotation-timebase NAME` | `raw-primary` | 标注时间基准：`raw-primary` 或 `aligned` |
-| `--include-only-left` | 命令行默认关闭；`instances.segments` 标注格式下自动开启 | 额外导出主视角的左眼裁剪视频 |
+| `--include-only-left` | 开启 | 显式请求主视角左眼裁剪；默认已开启 |
 | `--simple-output-names` | 关闭 | 使用 `primary.mp4` 等简化名称 |
-| `--make-grid` | 关闭 | 每个 section 生成 2×2 网格视频 |
+| `--make-grid` | 关闭 | 在已有四路片段基础上生成 2×2 网格视频 |
 | `--grid-cell-width N` | `960` | 网格单元宽度 |
 | `--grid-cell-height N` | `540` | 网格单元高度 |
 
@@ -247,7 +248,6 @@ python3 clips.py --help
 python3 clips.py /data/session_001 \
   --annotation /data/session_001/annotation.json \
   --annotation-timebase aligned \
-  --include-only-left \
   --reencode
 ```
 
@@ -261,11 +261,10 @@ python3 clips.py /data/session_001 \
 python3 clips.py /data/session_001 \
   --annotation /data/session_001/annotation.json \
   --annotation-timebase raw-primary \
-  --include-only-left \
   --reencode
 ```
 
-如果不需要额外导出左眼裁剪视频，可以去掉 `--include-only-left`。不过，当 `annotation.json` 使用 `instances.segments` 格式时，脚本会自动启用左眼裁剪，即使没有这个参数。
+四路视频和左眼裁剪视频均为默认输出，不需要额外参数。
 
 ```bash
 python3 clips.py /data/session_001 \
@@ -274,7 +273,7 @@ python3 clips.py /data/session_001 \
   --reencode
 ```
 
-每个 section 的时间区间都会规划一组四路输出。四路视频使用同一个 wall-clock 时间区间，因此不同视角的相对视频时间可以不同，但实际采集时刻一致。当前输出路径按 `section_<id>/` 组织，多个区间共用同一个 section ID 时请注意文件覆盖问题。
+默认每个 section 的时间区间规划四路输出和一个单独左目输出。四路视频使用同一个 wall-clock 时间区间，因此不同视角的相对视频时间可以不同，但实际采集时刻一致。当前输出路径按 `section_<id>/` 组织，多个区间共用同一个 section ID 时请注意文件覆盖问题。
 
 ### 2. 导出完整对齐视频
 
@@ -296,21 +295,20 @@ python3 clips.py /data/session_001/aligned \
 
 此时标注区间被视为已对齐视频的相对秒数，不再重新计算四路视频之间的 wall-clock 映射。
 
-### 4. 导出左眼裁剪片段
+### 4. 左眼裁剪片段
 
 ```bash
 python3 clips.py /data/session_001 \
-  --include-only-left \
   --reencode
 ```
 
 默认使用 FFmpeg 滤镜：
 
 ```text
-crop=1920:1200:160:0
+crop=(iw-160)/2:ih:160:0
 ```
 
-该滤镜从主视角视频中裁剪出 `1920×1200` 区域，起点为 `(160, 0)`。如需适配其他输入分辨率，应修改代码中的 `LEFT_ONLY_CROP_FILTER`。
+该滤镜先删除主视角视频左边 160 像素的二维码区域，再将剩余双目画面二等分并取左半幅，不进行缩放。对于 `4000×1200` 的输入，输出为 `1920×1200`。
 
 ### 5. 生成四路 2×2 网格视频
 
@@ -358,16 +356,16 @@ clips/
 ├── alignment_report.csv
 ├── alignment_report.md
 └── section_1/
-    ├── recording_primary.mp4
-    ├── recording_left_hand.mp4
-    ├── recording_right_hand.mp4
-    ├── recording_secondary.mp4
-    ├── recording_primary_left.mp4       # 启用左眼裁切时生成
+    ├── only_left.mp4                    # 默认输出（4000×1200 输入时为 1920×1200）
+    ├── primary.mp4
+    ├── secondary.mp4
+    ├── left_hand.mp4
+    ├── right_hand.mp4
     ├── combined_grid.mp4                # 使用 --make-grid 时生成
     └── describe.txt                     # section 有 description 时生成
 ```
 
-使用 `--simple-output-names` 后，四路文件名会变为 `primary.mp4`、`secondary.mp4`、`left_hand.mp4`、`right_hand.mp4`，左眼裁剪文件名为 `only_left.mp4`。
+默认旧版 `section[]` 标注仍使用 `recording_primary_left.mp4`；使用 `--simple-output-names`（`instances.segments` 会自动启用）后左眼文件名为 `only_left.mp4`。
 
 ## 时间对齐逻辑
 
@@ -516,7 +514,7 @@ python3 clips.py /data/session_001 --no-timer
 
 ### 左眼裁剪失败
 
-默认裁剪区域要求输入视频至少足够覆盖 `crop=1920:1200:160:0`。如果输入分辨率不同，需要修改代码中的 `LEFT_ONLY_CROP_FILTER`。
+默认先裁掉输入画面左边 160 像素的二维码区域，再取剩余双目画面的左半幅，不做缩放（`crop=(iw-160)/2:ih:160:0`）。对于 `4000×1200` 的输入，左目输出为 `1920×1200`。
 
 ## 注意事项
 
